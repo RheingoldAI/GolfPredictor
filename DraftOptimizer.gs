@@ -403,18 +403,24 @@ function dynamicPickValue(player, myTeam, roundsRemaining) {
   var winUpside = player.winProb * 200;
   var fitBonus = player.courseFit * 3;
 
+  var baseValue;
+
   // Late rounds: if still need safe picks, prioritize safety heavily
   if (needMore > 0 && roundsRemaining <= needMore + 1) {
-    return cutSafety * scoreBenefit * 2.5 + winUpside * 0.3 + player.makeCutProb * 30;
+    baseValue = cutSafety * scoreBenefit * 2.5 + winUpside * 0.3 + player.makeCutProb * 30;
   }
-
   // Early/mid rounds: balanced approach with course-fit edge
-  if (roundsRemaining >= 5) {
-    return cutSafety * scoreBenefit + winUpside * 1.5 + fitBonus;
+  else if (roundsRemaining >= 5) {
+    baseValue = cutSafety * scoreBenefit + winUpside * 1.5 + fitBonus;
+  }
+  // Mid-late: slight safety lean
+  else {
+    baseValue = cutSafety * scoreBenefit * 1.3 + winUpside + fitBonus + player.makeCutProb * 10;
   }
 
-  // Mid-late: slight safety lean
-  return cutSafety * scoreBenefit * 1.3 + winUpside + fitBonus + player.makeCutProb * 10;
+  // Add small noise (5% of value) so close-value players can swap between sims.
+  // Models our own decision uncertainty — when two players are close, either is fine.
+  return baseValue + normalRandom(0, Math.abs(baseValue) * 0.05);
 }
 
 
@@ -435,14 +441,6 @@ function runDraftOptimizer(myPosition, tournament, players) {
   var bigNameSet = {};
   BIG_NAMES.forEach(function(n) { bigNameSet[n] = true; });
 
-  // Assign drafter types: 7 rational, 2 emotional (randomized positions)
-  var emotionalTeams = {};
-  var emotionalSlots = shuffle([0,1,2,3,4,5,6,7,8,9].filter(function(t) {
-    return t !== myPosition - 1;
-  }));
-  emotionalTeams[emotionalSlots[0]] = true;
-  emotionalTeams[emotionalSlots[1]] = true;
-
   var allResults = [];
   var playerDraftFreq = {};  // Track how often each player is drafted by us
   var roundPicks = {};       // Track picks per round: { round: { playerName: count } }
@@ -456,6 +454,14 @@ function runDraftOptimizer(myPosition, tournament, players) {
         'Simulating...', 3
       );
     }
+
+    // Randomize which 2 opponents are emotional EACH sim (not fixed across all sims)
+    var emotionalTeams = {};
+    var emotionalSlots = shuffle([0,1,2,3,4,5,6,7,8,9].filter(function(t) {
+      return t !== myPosition - 1;
+    }));
+    emotionalTeams[emotionalSlots[0]] = true;
+    emotionalTeams[emotionalSlots[1]] = true;
 
     // Run one draft simulation
     var teams = simulateSnakeDraft(myPosition, players, bigNameSet, emotionalTeams);
@@ -537,20 +543,20 @@ function simulateSnakeDraft(myPosition, players, bigNameSet, emotionalTeams) {
 
   var taken = {};  // playerIndex -> true
 
-  // Pre-compute noisy ADP for each opponent this sim
-  // Noise scales with ADP: top-3 picks are nearly locked, mid-round has real variance
-  var noisyAdp = [];
-  for (var pi = 0; pi < players.length; pi++) {
-    noisyAdp.push(players[pi].adp + adpNoise(players[pi].adp));
-  }
-
-  // Emotional drafters: boost big names higher (lower ADP = picked sooner)
-  var emotionalAdp = [];
-  for (var ei = 0; ei < players.length; ei++) {
-    if (bigNameSet[players[ei].name]) {
-      emotionalAdp.push(players[ei].adp - CONFIG.EMOTIONAL_BOOST + normalRandom(0, 2));
-    } else {
-      emotionalAdp.push(players[ei].adp + adpNoise(players[ei].adp));
+  // Build per-opponent ADP rankings — each opponent gets their OWN independent
+  // noisy view of the draft board. This is the key variance driver: 9 different
+  // rankings means 9 different pick orders, creating realistic draft chaos.
+  var opponentAdp = {};
+  for (var oi = 0; oi < numTeams; oi++) {
+    if (oi === myPosition - 1) continue; // skip our team
+    opponentAdp[oi] = [];
+    for (var pi = 0; pi < players.length; pi++) {
+      if (emotionalTeams[oi] && bigNameSet[players[pi].name]) {
+        // Emotional drafter: big names get boosted (lower ADP = picked sooner)
+        opponentAdp[oi].push(players[pi].adp - CONFIG.EMOTIONAL_BOOST + normalRandom(0, 2));
+      } else {
+        opponentAdp[oi].push(players[pi].adp + adpNoise(players[pi].adp));
+      }
     }
   }
 
@@ -573,24 +579,15 @@ function simulateSnakeDraft(myPosition, players, bigNameSet, emotionalTeams) {
           bestIdx = j;
         }
       }
-    } else if (emotionalTeams[team]) {
-      // EMOTIONAL OPPONENT: use emotionalAdp
-      var bestAdp = Infinity;
+    } else {
+      // OPPONENT PICK: use their personalized ADP ranking
+      // (emotional vs rational behavior is already baked into opponentAdp[team])
+      var bestAdpO = Infinity;
       for (var k = 0; k < players.length; k++) {
         if (taken[k]) continue;
-        if (emotionalAdp[k] < bestAdp) {
-          bestAdp = emotionalAdp[k];
+        if (opponentAdp[team][k] < bestAdpO) {
+          bestAdpO = opponentAdp[team][k];
           bestIdx = k;
-        }
-      }
-    } else {
-      // RATIONAL OPPONENT: use noisyAdp (odds-based)
-      var bestAdpR = Infinity;
-      for (var m = 0; m < players.length; m++) {
-        if (taken[m]) continue;
-        if (noisyAdp[m] < bestAdpR) {
-          bestAdpR = noisyAdp[m];
-          bestIdx = m;
         }
       }
     }
@@ -888,16 +885,16 @@ function normalRandom(mean, sd) {
 
 // ADP-dependent noise: consensus is tight at the top, loose in later rounds.
 // ADP 1-3: virtually zero noise (everyone knows who #1-3 are)
-// ADP 4-10: very tight (minor disagreements)
-// ADP 11-25: moderate variance
-// ADP 26-50: real disagreement territory
-// ADP 51+: wide open, big variance
+// ADP 4-10: real disagreements (2-4 spot swaps common)
+// ADP 11-25: significant variance (5-7 spot swaps happen often)
+// ADP 26-50: wide open, players can move 8-10 spots
+// ADP 51+: anyone's guess, big variance
 function adpNoise(adp) {
   if (adp <= 3)  return normalRandom(0, 0.3);
-  if (adp <= 10) return normalRandom(0, 1.0);
-  if (adp <= 25) return normalRandom(0, 2.0);
-  if (adp <= 50) return normalRandom(0, 3.5);
-  return normalRandom(0, 5.0);
+  if (adp <= 10) return normalRandom(0, 2.0);
+  if (adp <= 25) return normalRandom(0, 3.5);
+  if (adp <= 50) return normalRandom(0, 5.0);
+  return normalRandom(0, 6.0);
 }
 
 function shuffle(arr) {
